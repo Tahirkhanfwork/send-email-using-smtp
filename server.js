@@ -3,13 +3,14 @@ const net = require("net");
 const tls = require("tls");
 const { Buffer } = require("buffer");
 const axios = require("axios");
-
+require("dotenv").config();
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 
 async function getAccessToken(clientId, clientSecret, refreshToken) {
+  console.log(clientId)
   try {
     const url = "https://oauth2.googleapis.com/token";
     const data = {
@@ -32,100 +33,147 @@ async function getAccessToken(clientId, clientSecret, refreshToken) {
 
 async function sendEmailUsingSMTP(from, to, subject, body) {
   const port = 587;
-  let smtpHost;
+  const smtpHost = "smtp.gmail.com";
+  let socket;
+  let responseBuffer = '';
+  let timeout;
 
-  try {
-    smtpHost = "smtp.gmail.com";
-  } catch (err) {
-    throw new Error("Failed to determine SMTP server: " + err);
-  }
-
-  let socket, commands;
-  const useTLS = false;
-
-    const accessToken = await getAccessToken(
+  // Get OAuth token
+  const accessToken = await getAccessToken(
     process.env.CLIENT_ID,
     process.env.CLIENT_SECRET,
     process.env.REFRESH_TOKEN
   );
+  
+  if (!accessToken?.access_token) {
+    throw new Error("Failed to obtain OAuth access token");
+  }
 
+  // Prepare authentication string
   const authString = `user=${from}\x01auth=Bearer ${accessToken.access_token}\x01\x01`;
   const xoauth2 = Buffer.from(authString).toString("base64");
 
-  commands = [
-    `EHLO ${smtpHost}\r\n`,
-    !useTLS ? "STARTTLS\r\n" : null,
-    !useTLS ? `EHLO ${smtpHost}\r\n` : null,
-    "AUTH XOAUTH2 " + xoauth2 + "\r\n",
-    `MAIL FROM:<${from}>\r\n`,
-    `RCPT TO:<${to}>\r\n`,
-    "DATA\r\n",
-    `Subject: ${subject}\r\nFrom: ${from}\r\nTo: ${to}\r\n\r\n${body}\r\n.\r\n`,
-    "QUIT\r\n",
-  ].filter(Boolean);
+  // Modified command sequence - now includes waiting for initial 220
+  const commands = [
+    { expect: /220/ }, // Wait for server greeting first
+    { cmd: `EHLO ${smtpHost}\r\n`, expect: /250/ },
+    { cmd: "STARTTLS\r\n", expect: /220/ },
+    { cmd: `EHLO ${smtpHost}\r\n`, expect: /250/, tls: true },
+    { cmd: "AUTH XOAUTH2 " + xoauth2 + "\r\n", expect: /235/ },
+    { cmd: `MAIL FROM:<${from}>\r\n`, expect: /250/ },
+    { cmd: `RCPT TO:<${to}>\r\n`, expect: /250/ },
+    { cmd: "DATA\r\n", expect: /354/ },
+    { cmd: `Subject: ${subject}\r\nFrom: ${from}\r\nTo: ${to}\r\n\r\n${body}\r\n.\r\n`, expect: /250/ },
+    { cmd: "QUIT\r\n", expect: /221/ }
+  ];
 
-  let commandIndex = 0;
+  return new Promise((resolve, reject) => {
+    let currentCommand = 0;
+    let upgradedToTLS = false;
 
-  function sendNextCommand() {
-    if (commandIndex < commands.length) {
-      socket.write(commands[commandIndex]);
-      commandIndex++;
-    }
-  }
+    const resetTimeout = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        socket.end();
+        reject(new Error("SMTP timeout - no response from server"));
+      }, 30000);
+    };
 
-  function startTLSUpgrade() {
-    if (commands[commandIndex - 1] === "STARTTLS\r\n") {
-      socket = tls.connect({ socket, rejectUnauthorized: false }, () => {
-        setTimeout(() => sendNextCommand(), 500);
-      });
-    }
+    const sendNextCommand = () => {
+      if (currentCommand >= commands.length) return;
+      
+      // Only send if there's a command to send (first step is just waiting)
+      if (commands[currentCommand].cmd) {
+        resetTimeout();
+        console.log('Sending:', commands[currentCommand].cmd.trim());
+        socket.write(commands[currentCommand].cmd);
+      }
+    };
 
-    socket.on("data", onData);
-    socket.on("error", onError);
-    socket.on("end", onEnd);
-  }
-
-  async function onData(data) {
-    if (commands[commandIndex - 1] === "STARTTLS\r\n") {
-      startTLSUpgrade();
-    } else if (commandIndex < commands.length) {
-      sendNextCommand();
-    } else {
-      socket.end();
-      const sentEmail = {
-        from,
-        to,
-        subject,
-        body,
-        direction: "outbound",
-        type: "email",
-        date: new Date(),
-        isSMTPSent: true,
-      };
-    }
-  }
-
-  function onError(err) {
-    console.error("SMTP Error:", err);
-  }
-
-  function onEnd() {
-    console.log("Disconnected from SMTP server");
-  }
-
-  if (useTLS) {
-    socket = tls.connect(port, smtpHost, { rejectUnauthorized: false }, () => {
-      console.log("Connected securely with TLS");
-    });
-  } else {
+    // Create initial connection
     socket = net.createConnection(port, smtpHost, () => {
-      console.log("Connected to SMTP server (STARTTLS mode)");
+      console.log("Connected to SMTP server");
+      resetTimeout();
+      // Don't send anything yet - wait for server greeting
     });
-  }
 
-  socket.on("data", onData);
-  socket.on("error", onError);
-  socket.on("end", onEnd);
+    socket.on('data', (data) => {
+      responseBuffer += data.toString();
+      console.log('Received:', responseBuffer.trim());
+
+      // Check for complete response (ends with \r\n)
+      if (!responseBuffer.endsWith('\r\n')) {
+        return; // Wait for complete response
+      }
+
+      resetTimeout();
+
+      const expectedResponse = commands[currentCommand]?.expect;
+      const isError = /^[45]\d{2}/.test(responseBuffer);
+
+      if (isError) {
+        socket.end();
+        reject(new Error(`SMTP Error: ${responseBuffer.trim()}`));
+        return;
+      }
+
+      if (expectedResponse && expectedResponse.test(responseBuffer)) {
+        responseBuffer = '';
+        
+        // Handle TLS upgrade
+        if (commands[currentCommand].cmd === "STARTTLS\r\n") {
+          const secureSocket = tls.connect({
+            socket: socket,
+            rejectUnauthorized: true,
+            servername: smtpHost
+          }, () => {
+            console.log("TLS upgrade complete");
+            upgradedToTLS = true;
+            currentCommand++;
+            sendNextCommand();
+          });
+
+          secureSocket.on('error', (err) => {
+            console.error('TLS error:', err);
+            reject(err);
+          });
+          
+          secureSocket.on('data', socket.emit.bind(socket, 'data'));
+          socket = secureSocket;
+          return;
+        }
+
+        currentCommand++;
+        if (currentCommand < commands.length) {
+          sendNextCommand();
+        } else {
+          socket.end();
+          resolve({ success: true });
+        }
+      } else {
+        // Unexpected response
+        socket.end();
+        reject(new Error(`Unexpected SMTP response: ${responseBuffer.trim()}`));
+      }
+    });
+
+
+    socket.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    socket.on('end', () => {
+      clearTimeout(timeout);
+      if (currentCommand < commands.length - 1) {
+        reject(new Error("Connection ended prematurely"));
+      }
+    });
+
+    socket.on('close', () => {
+      clearTimeout(timeout);
+    });
+  });
 }
 
 app.post("/send-email", async (req, res) => {
