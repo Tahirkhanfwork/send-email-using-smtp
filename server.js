@@ -43,12 +43,11 @@ async function sendEmailUsingSMTP(from, to, subject, body) {
   let socket, commands;
   const useTLS = false;
 
-  const accessToken = await getAccessToken(
-    process.env.GMAIL_CLIENT_ID,
-    process.env.GMAIL_CLIENT_SECRET,
-    process.env.GMAIL_REFRESH_TOKEN
+    const accessToken = await getAccessToken(
+    process.env.CLIENT_ID,
+    process.env.CLIENT_SECRET,
+    process.env.REFRESH_TOKEN
   );
-  console.log(from);
 
   const authString = `user=${from}\x01auth=Bearer ${accessToken.access_token}\x01\x01`;
   const xoauth2 = Buffer.from(authString).toString("base64");
